@@ -1136,6 +1136,178 @@ body.touch #ksMsg.show{transform:none}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
+/* ================= online play outside Claude =================
+   Inside Claude, online play uses Claude's built-in room. Anywhere else (this game on
+   GitHub Pages, or a saved copy) this stand-in offers the same small interface, built on
+   Trystero (https://github.com/dmotz/trystero, MIT License, bundled in vendor/):
+   players' browsers connect directly to each other over WebRTC, and public Nostr relays
+   only introduce them. Game data never passes through the relays.
+   Some networks (strict school or work Wi-Fi, some mobile data) block direct
+   connections. To let players on those networks connect, add a TURN relay server to
+   turnConfig below. */
+window.hollowstrikeNet = (() => {
+  'use strict';
+  const CONFIG = Object.assign({
+    appId: 'hollowstrike-online',
+    relayRedundancy: 10,   // public relays to use at once; extras keep it working as relays come and go
+    relayUrls: null,       // your own relay list, used instead of the defaults
+    turnConfig: null,      // e.g. [{ urls: 'turn:turn.example.com:3478', username: 'name', credential: 'secret' }]
+    rtcConfig: null,
+    lib: ['vendor/trystero-nostr.min.js', 'https://cdn.jsdelivr.net/npm/trystero@0.26.0/+esm']
+  }, window.HOLLOWSTRIKE_NET_CONFIG || {});
+  const SEND_GAP = 1000 / 30;  // each player sends at most 30 updates a second per room
+  const NOTIFY_GAP = 50;       // batch change notifications for the screens
+  const STUCK_MS = 12000;      // still no relay after this long: tell the player
+  const now = () => performance.now();
+  const rooms = new Set();
+  let libP = null, lobbyP = null;
+
+  function loadLib() {
+    return libP || (libP = (async () => {
+      let err = null;
+      for (const src of CONFIG.lib) {
+        try {
+          const m = await import(new URL(src, document.baseURI).href);
+          if (m && typeof m.joinRoom === 'function') return m;
+        } catch (e) { err = e; }
+      }
+      throw err || new Error('The online library did not load');
+    })());
+  }
+
+  function trysteroConfig() {
+    const c = { appId: CONFIG.appId, maxReceiveBytes: 64 * 1024, relayConfig: { redundancy: CONFIG.relayRedundancy, warnOnRelayFailure: false } };
+    if (CONFIG.relayUrls) c.relayConfig.urls = CONFIG.relayUrls;
+    if (CONFIG.turnConfig) c.turnConfig = CONFIG.turnConfig;
+    if (CONFIG.rtcConfig) c.rtcConfig = CONFIG.rtcConfig;
+    return c;
+  }
+
+  // One room. Everyone in it shares a "presence" (their latest state) with everyone else,
+  // the same model as Claude's room. Only the newest presence matters, so a slow link gets
+  // fewer, fresher updates instead of a growing backlog.
+  function openRoom(T, roomId) {
+    const peers = new Map(), subs = new Set(), failed = new Set(), count = { sent: 0, recv: 0 };
+    let mine = null, seq = 0, lastFlush = -1e9, flushT = 0, notifyT = 0, closed = false;
+    const notify = () => {
+      if (notifyT || closed) return;
+      notifyT = setTimeout(() => {
+        notifyT = 0;
+        for (const cb of [...subs]) { try { cb(); } catch (e) { console.warn(e); } }
+      }, NOTIFY_GAP);
+    };
+    const room = T.joinRoom(trysteroConfig(), roomId, {
+      onJoinError: d => { if (d && d.peerId) { failed.add(d.peerId); notify(); } }
+    });
+    const act = room.makeAction('pr');
+    const entry = id => {
+      let p = peers.get(id);
+      if (!p) peers.set(id, p = { presence: null, got: -1, sent: 0, busy: false, again: false });
+      return p;
+    };
+    function sendTo(id) {
+      const p = peers.get(id);
+      if (!p || closed || p.sent === seq) return;
+      if (p.busy) { p.again = true; return; }
+      p.busy = true; p.again = false; p.sent = seq; count.sent++;
+      let job;
+      try { job = act.send({ s: seq, p: mine }, { target: id }); } catch (e) { job = Promise.reject(e); }
+      Promise.resolve(job).then(
+        () => { p.busy = false; if (p.again) sendTo(id); },
+        () => { p.busy = false; p.sent = -1; setTimeout(() => sendTo(id), 1000); });
+    }
+    function flush() { flushT = 0; lastFlush = now(); for (const id of peers.keys()) sendTo(id); }
+    room.onPeerJoin = id => { failed.delete(id); entry(id); sendTo(id); notify(); };
+    room.onPeerLeave = id => { peers.delete(id); notify(); };
+    act.onMessage = (d, meta) => {
+      const id = meta && meta.peerId;
+      if (!id || !d || typeof d !== 'object' || !Number.isFinite(d.s)) return;
+      const pr = d.p;
+      if (pr !== null && (typeof pr !== 'object' || Array.isArray(pr))) return;
+      const p = entry(id);
+      if (d.s <= p.got) return;
+      p.got = d.s; p.presence = pr; count.recv++; notify();
+    };
+    const api = {
+      standIn: true,
+      peers: () => [{ peer: T.selfId, sameTab: true, presence: mine }]
+        .concat(Array.from(peers, ([peer, p]) => ({ peer, sameTab: false, presence: p.presence }))),
+      presence(obj) {
+        if (closed) return Promise.resolve();
+        mine = obj && typeof obj === 'object' ? obj : null; seq++;
+        if (!flushT) {
+          const wait = lastFlush + SEND_GAP - now();
+          if (wait <= 0) flush(); else flushT = setTimeout(flush, wait);
+        }
+        return Promise.resolve();
+      },
+      onPeers(cb) { if (typeof cb === 'function') subs.add(cb); return () => { subs.delete(cb); }; },
+      async leave() {
+        if (closed) return;
+        closed = true; rooms.delete(api);
+        clearTimeout(flushT); clearTimeout(notifyT); subs.clear(); peers.clear();
+        try { await room.leave(); } catch (e) {}
+      },
+      status: () => ({ failed: failed.size }),
+      stats: () => ({ room: roomId, peers: peers.size, sent: count.sent, recv: count.recv, failed: failed.size })
+    };
+    rooms.add(api);
+    return api;
+  }
+
+  // The lobby is a room too: hosts advertise their game in it, so other players see it
+  // under Open games. It's only joined while the Online screen is open or you're hosting.
+  async function use(name) {
+    if (name !== 'room') throw new Error('Only online rooms are available here');
+    return lobbyP || (lobbyP = (async () => {
+      const T = await loadLib();
+      const subs = new Set();
+      let inner = null, mine = null, wanted = true, since = now(), online = false, stuck = false;
+      const notify = () => { for (const cb of [...subs]) { try { cb(); } catch (e) { console.warn(e); } } };
+      const hasContent = o => !!o && Object.keys(o).some(k => o[k] != null);
+      const isStuck = () => !online && !!inner && now() - since > STUCK_MS;
+      function settle() {
+        const need = wanted || hasContent(mine);
+        if (need && !inner) {
+          inner = openRoom(T, 'lobby'); inner.onPeers(notify); since = now();
+          if (mine) inner.presence(mine);
+        } else if (!need && inner) {
+          const r = inner; inner = null; r.leave(); notify();
+        }
+      }
+      setInterval(() => {
+        let n = 0;
+        try { for (const ws of Object.values(T.getRelaySockets() || {})) if (ws && ws.readyState === 1) n++; } catch (e) {}
+        const on = n > 0, st = isStuck();
+        if (on !== online || st !== stuck) { online = on; stuck = st; notify(); }
+      }, 1000);
+      settle();
+      return {
+        standIn: true,
+        peers: () => inner ? inner.peers() : [{ peer: T.selfId, sameTab: true, presence: mine }],
+        presence(obj) {
+          mine = obj && typeof obj === 'object' ? obj : null;
+          if (inner) inner.presence(mine);
+          settle();
+          return Promise.resolve();
+        },
+        onPeers(cb) { if (typeof cb === 'function') subs.add(cb); return () => { subs.delete(cb); }; },
+        join: async roomName => openRoom(T, String(roomName)),
+        wake() { wanted = true; settle(); },
+        sleep() { wanted = false; settle(); },
+        status: () => ({ online, stuck: isStuck(), failed: inner ? inner.status().failed : 0 })
+      };
+    })());
+  }
+
+  // Hang up when the page goes away, so the others hear about it right away. (Trystero
+  // does this on beforeunload, which phones don't always fire; pagehide covers them.)
+  addEventListener('pagehide', () => { for (const r of [...rooms]) r.leave(); });
+
+  return { use, stats: () => Array.from(rooms, r => r.stats()) };
+})();
+</script>
+<script>
 (() => {
 'use strict';
 const $ = s => document.querySelector(s);
@@ -6166,9 +6338,11 @@ const byteLen = t => unescape(encodeURIComponent(t)).length;
 function withSeed(seed, fn) { const r0 = Math.random; Math.random = seeded((seed | 0) + 1); try { return fn(); } finally { Math.random = r0; } }
 const origin = () => (CUR && G && G.players && G.players.includes(CUR) ? CUR.idx : -1);
 
+// In Claude, online play uses Claude's room; anywhere else, the stand-in in hollowstrikeNet (top of the page)
+const inClaude = () => !!(window.claude && typeof window.claude.use === 'function');
 async function netApi() {
   if (NET.api) return NET.api;
-  if (!NET.apiP) NET.apiP = (async () => { try { return window.claude && typeof window.claude.use === 'function' ? await window.claude.use('room') : null; } catch (e) { return null; } })();
+  if (!NET.apiP) NET.apiP = (async () => { try { return inClaude() ? await window.claude.use('room') : window.hollowstrikeNet ? await window.hollowstrikeNet.use('room') : null; } catch (e) { return null; } })();
   NET.api = await NET.apiP; NET.apiDone = true;
   if (NET.api && !NET.lobbyOff) { try { NET.lobbyOff = NET.api.onPeers(() => { if (!$('#online').hidden) renderOnline(); }, () => {}); } catch (e) {} }
   return NET.api;
@@ -6899,10 +7073,11 @@ function netClientClear() {
 
 /* ---------- the online screen ---------- */
 function openOnline() {
+  if (!inClaude()) { const tg = $('#online .tagline'); if (tg) tg.textContent = 'Team up or face off across devices. Open this page on each device, host a game on one, and it shows up on the others under Open games.'; }
   show('online'); renderOnline();
-  netApi().then(() => { renderOnline(); const f = $('#onBody button:not([disabled])') || $('#btnOnBack'); if (lastDev === 'pad') padFocus(f); else if (document.activeElement === document.body) f.focus(); });
+  netApi().then(() => { if (NET.api && NET.api.standIn) NET.api.wake(); renderOnline(); const f = $('#onBody button:not([disabled])') || $('#btnOnBack'); if (lastDev === 'pad') padFocus(f); else if (document.activeElement === document.body) f.focus(); });
 }
-function closeOnline() { netLeave(); NET.msg = ''; show('menu'); const b = $('#btnOnline'); if (lastDev === 'pad') padFocus(b); else b.focus(); }
+function closeOnline() { netLeave(); if (NET.api && NET.api.standIn) NET.api.sleep(); NET.msg = ''; show('menu'); const b = $('#btnOnline'); if (lastDev === 'pad') padFocus(b); else b.focus(); }
 const mapName = id => (MAPS.find(m => m.id === id) || {}).name || 'Unknown arena', modeName = id => id === 'pvp' ? 'Versus' : (MODES.find(m => m.id === id) || {}).name || 'Survival';
 function onPlayers(pl, me) {
   return `<div class="onplayers">${pl.map(e => { const i = e[2] | 0, c = CHARS[netNum(e[1] | 0, 0, CHARS.length - 1)]; return `<div class="onp" style="--pc:${PCOL[i] || PCOL[0]}"><b>P${i + 1}</b><span style="color:${c.css}">${c.name}</span><small>${c.role}${e[0] === me ? ' · you' : i === 0 ? ' · host' : ''}</small></div>`; }).join('')}</div>`;
@@ -6914,7 +7089,8 @@ function renderOnline() {
   const msg = NET.msg ? `<p class="onmsg">${netEsc(NET.msg)}</p>` : '';
   let html = '<p class="onwait">Connecting…</p>';
   if (NET.apiDone && !NET.api) {
-    html = `<div class="onoff"><b>Online play isn’t available here</b><p>It works when this game is open in Claude while you’re signed in. A copy opened from a public link or a saved file can’t go online. Everything else, including split-screen, still works.</p></div>`;
+    html = inClaude() ? `<div class="onoff"><b>Online play isn’t available here</b><p>It works when this game is open in Claude while you’re signed in. A copy opened from a public link or a saved file can’t go online. Everything else, including split-screen, still works.</p></div>`
+      : `<div class="onoff"><b>Online play couldn’t start</b><p>Check your internet connection, then reload the page. Everything else, including split-screen, still works.</p></div>`;
   } else if (NET.api && NET.mode === 'host') {
     const pl = [[netMyPeer(), selChar, 0]].concat(NET.slots.map((sl, i) => [sl.peer, sl.hero, i + 1])), n = pl.length;
     html = `${msg}<div class="oncode"><span class="lbl">Your game</span><b>${NET.code}</b><small>${n > 1 ? `${n} players ready` : 'Waiting for players. On the other device open Online, then join this game.'}</small></div>
@@ -6925,13 +7101,18 @@ function renderOnline() {
   } else if (NET.api && NET.mode === 'client') {
     const host = NET.room && NET.room.peers().find(p => p.presence && p.presence.r === 'h'), hp = host && host.presence, pl = hp && Array.isArray(hp.pl) ? hp.pl.filter(e => Array.isArray(e)) : [];
     const inList = pl.some(e => e[0] === NET.me);
-    const sub = !hp ? 'Looking for the host…' : hp.st === 'lobby' ? (inList ? 'You’re in. Waiting for the host to start' : 'Joining…') : inList ? 'The round is starting' : 'A round is under way. You join the next one';
+    const rst = NET.room && NET.room.standIn ? NET.room.status() : null;
+    const sub = !hp ? (rst && rst.failed ? 'Couldn’t connect to the host. Some networks, like school or work Wi-Fi, block online play.' : 'Looking for the host…') : hp.st === 'lobby' ? (inList ? 'You’re in. Waiting for the host to start' : 'Joining…') : inList ? 'The round is starting' : 'A round is under way. You join the next one';
     html = `${msg}<div class="oncode"><span class="lbl">Joined game</span><b>${netEsc(NET.code)}</b><small>${sub}</small></div>${pl.length ? onPlayers(pl, NET.me) : ''}
       <div class="actions"><button class="btn" data-on="leave">Leave game</button></div>`;
   } else if (NET.api) {
+    const st = NET.api.standIn ? NET.api.status() : null;
+    const netNote = !st ? '' : st.stuck ? '<p class="onmsg">Can’t reach the online network right now. Check your connection, then try again.</p>'
+      : !st.online ? '<p class="onnote">Connecting to the online network…</p>'
+      : st.failed ? `<p class="onnote">Couldn’t connect to ${st.failed === 1 ? 'one player' : st.failed + ' players'}. Some networks, like school or work Wi-Fi, block online play.</p>` : '';
     const games = NET.api.peers().filter(p => !p.sameTab && p.presence && p.presence.ew && typeof p.presence.ew === 'object' && p.presence.ew.v === NET_V && /^[A-Z]{4}$/.test(p.presence.ew.c || ''));
     html = `${msg}${you}<div class="actions"><button class="btn primary" data-on="host">Host a game</button></div>
-      <span class="lbl">Open games</span>
+      <span class="lbl">Open games</span>${netNote}
       <div class="ongames">${games.length ? games.map(p => { const a = p.presence.ew, open = a.s === 'open', c = CHARS[netNum(a.h | 0, 0, CHARS.length - 1)]; return `<div class="ongame"><div><b>Game ${a.c}</b><small>${mapName(a.m)} · ${modeName(a.md)} · ${netNum(a.n | 0, 1, 4)} of 4 · host plays ${c.name}${open ? '' : ' · in a round'}</small></div><button class="btn small" data-on="join" data-code="${a.c}" data-peer="${netEsc(p.peer)}">Join</button></div>`; }).join('')
         : '<p class="onnote">No open games yet. When someone hosts on another device, it shows up here.</p>'}</div>`;
   }

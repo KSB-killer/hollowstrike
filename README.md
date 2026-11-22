@@ -20,6 +20,7 @@ Works with mouse and keyboard, a gamepad, or touch controls on phones and tablet
 - **Operations:** a campaign of missions
 - **Parkour:** ten courses to race through
 - **Split-screen** for up to four players on one screen, co-op or versus
+- **Online play** for up to four players on their own devices, co-op or versus
 - **Armory and Records:** level up, unlock camos, and track your best runs
 
 ## Controls
@@ -44,8 +45,16 @@ Works with mouse and keyboard, a gamepad, or touch controls on phones and tablet
 
 Every key can be changed in **Settings**.
 
+## Playing online
+
+Open the game on each device and choose **Online**. One player clicks **Host a game**. Everyone else sees it under **Open games** and clicks **Join**.
+
+- Players' browsers connect directly to each other. Public [Nostr](https://nostr.com/) relays only help them find each other, so game data never goes through a server.
+- Some networks, like school or work Wi-Fi and some mobile data, block direct connections. Players on those networks see a message saying they couldn't connect. To let them play, add a TURN relay server to `turnConfig` in the online section near the top of the scripts in `index.html`.
+- As in any peer-to-peer game, players you connect with can see your IP address.
+- This version and the copy in Claude can't play together. Everyone needs to open the same one.
+
 ## Notes
 
-- **Online play** uses a feature that only exists inside Claude, so it only works when the game is opened in Claude. Everywhere else, the Online screen says it isn't available. Every other mode works anywhere, split-screen included.
 - **Progress** (settings, unlocks, records) is saved in your browser, so it stays on the device and browser you play on.
-- Built with [three.js](https://threejs.org/) r128 (loaded from cdnjs) and the Bungee and Barlow Condensed fonts from Google Fonts.
+- Built with [three.js](https://threejs.org/) r128 (loaded from cdnjs), the Bungee and Barlow Condensed fonts from Google Fonts, and [Trystero](https://github.com/dmotz/trystero) for online play (bundled in `vendor/`, MIT License).
